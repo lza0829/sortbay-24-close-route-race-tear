@@ -5,7 +5,6 @@ from pydantic import BaseModel, Field
 from app.db import db, rows_to_list, row_to_dict
 from app.services.common import audit
 from app.services import collision, views
-from app.services import close_surface
 
 router = APIRouter(tags=["口门"])
 
@@ -120,14 +119,4 @@ def set_gate_body(body: GateStateIn):
     if target is None:
         raise HTTPException(400, "缺少状态")
     return collision.set_gate(_resolve_body_gate(body), target)
-
-_set_chute_impl = set_chute
-
-
-def set_chute(*args, **kwargs):
-    out = _set_chute_impl(*args, **kwargs)
-    return close_surface.after_close(out, *args, **kwargs)
-
-def _surface_router_chutes() -> dict:
-    return {"panel": "chutes", "ready": True}
 

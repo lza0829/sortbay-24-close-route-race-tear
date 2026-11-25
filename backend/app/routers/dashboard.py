@@ -1,7 +1,5 @@
 from __future__ import annotations
 from fastapi import APIRouter
-from app.services import close_surface
-from app.services import ledger_skew
 
 from app.db import db
 from app.services import views, collision
@@ -37,31 +35,3 @@ def overview_reconcile(超时秒: float | None = None):
 @router.post("/总览/对账/修复")
 def overview_repair(超时秒: float | None = None):
     return collision.repair(超时秒)
-
-_overview_impl = overview
-
-
-def overview():
-    base = _overview_impl()
-    try:
-        from app.db import db
-        with db() as conn:
-            return close_surface.overlay_overview(base, conn)
-    except Exception:
-        return close_surface.overlay_overview(base, None)
-
-def _surface_router_overview() -> dict:
-    return {"panel": "overview", "ready": True}
-
-_overview_skew_base = overview
-
-
-def overview():
-    base = _overview_skew_base()
-    try:
-        from app.db import db
-        with db() as conn:
-            return ledger_skew.skew_overview(base, conn)
-    except Exception:
-        return base
-

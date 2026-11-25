@@ -250,6 +250,17 @@ def init_db() -> None:
             except sqlite3.DatabaseError:
                 pass
             conn.executescript(SCHEMA)
+            # 一次性收口：清除历史「假关口」涂写层遗留的表面标志键。
+            # 真态只认 chutes/scans/route_inflight/collision_runs/audit_events，
+            # 任何 surface_*/close_surface:*/close_route:* 影子账一律删除。
+            conn.execute(
+                """
+                DELETE FROM settings
+                WHERE key LIKE 'surface!_%' ESCAPE '!'
+                   OR key LIKE 'close!_surface:%' ESCAPE '!'
+                   OR key LIKE 'close!_route:%' ESCAPE '!'
+                """
+            )
     finally:
         _schema_state.in_init_db = False
 

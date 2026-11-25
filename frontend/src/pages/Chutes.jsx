@@ -7,7 +7,6 @@ function pressureClass(level) {
   return 'tag ok'
 }
 
-const surface_panel = true
 export default function Chutes() {
   const [rows, setRows] = useState([])
   const [err, setErr] = useState('')
@@ -33,7 +32,7 @@ export default function Chutes() {
   }
 
   return (
-    <div className={surface_panel ? "panel" : "panel"}>
+    <div className="panel">
       <h2>口门 · 闭口优先争用收口</h2>
       <p className="muted">
         口径：闭口一旦提交成功，并发在途裁决整笔失败——不改扫描口门列、不增在口件数；

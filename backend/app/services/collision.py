@@ -4,7 +4,6 @@ import os
 import threading
 import uuid
 from datetime import datetime, timedelta
-from app.services import close_surface
 
 from fastapi import HTTPException
 
@@ -169,6 +168,27 @@ def _best_effort_half_run(scan_id, chute_id, token, err) -> None:
         pass
 
 
+def _best_effort_half_gate_run(chute_id, target, err) -> None:
+    """写闸（闭口/开口）半截：落锤事务已整笔回滚，补记对撞账本与审计钉死这次半截。
+
+    与裁决半截同口径：before==after==回滚后现态，重放据此核对「徽标不得绿而
+    半空仍落入」——回滚后口门态必须退回对撞前快照。
+    """
+    try:
+        def work(conn):
+            snap = make_snapshot(conn, chute_id)
+            code = _insert_run(
+                conn, outcome=HALF_ROLLBACK, chute_id=chute_id, scan_id=None,
+                before=snap, after=snap,
+                close_receipt={"目标状态": target, "异常": repr(err)[:300]},
+                note="写闸半截，写事务整体回滚，退回对撞前快照",
+            )
+            audit(conn, "口门", chute_id, "半截回滚", f"{code} {repr(err)[:120]}")
+        run_write(work)
+    except Exception:
+        pass
+
+
 # ---------------------------------------------------------------- 裁决入口
 
 def adjudicate(scan_id: int) -> dict:
@@ -321,7 +341,15 @@ def normalize_gate_state(value) -> str:
 
 def set_gate(chute_id: int, target: str) -> dict:
     target = normalize_gate_state(target)
-    return critical(lambda conn: _gate_decisive(conn, chute_id, target))
+    try:
+        return critical(lambda conn: _gate_decisive(conn, chute_id, target))
+    except HTTPException:
+        # 校验类失败（口门不存在等）未产生任何半截写入，直接透传
+        raise
+    except Exception as exc:
+        # 写闸半截：run_write 已整笔回滚；补记对撞账本+审计，钉死这次半截
+        _best_effort_half_gate_run(chute_id, target, exc)
+        raise
 
 
 def resolve_chute_id(conn, *, 口门编号=None, chute_id=None, id=None,
@@ -368,9 +396,23 @@ def _gate_decisive(conn, chute_id: int, target: str) -> dict:
     seam("gate_after_status_write", conn=conn, chute_id=chute_id, target=target)
 
     updated = conn.execute("SELECT * FROM chutes WHERE id=?", (chute_id,)).fetchone()
-    detail = views.chute_detail(conn, updated)
     landed = views.landed_items(conn, chute_id)
     inflight = views.inflight_items(conn, chute_id)
+
+    if target == "口门闭" and inflight:
+        # 写闸拒证：闭口落锤同事务把该口在途裁决登记收口为「已拒绝」。
+        # 与裁决落锤段共用同一把进程锁 + 同一 BEGIN IMMEDIATE 写事务，
+        # 不存在半截；在途裁决自身的落锤段随后仍会补写自己的拒收回执与
+        # 对撞账本（同命运终态，不是另一张影子账）。
+        conn.execute(
+            "UPDATE route_inflight SET status='已拒绝', updated_at=?, note=? "
+            "WHERE chute_id=? AND status='在途'",
+            (now_str(), f"{CLOSE_FIRST_REJECT}·闭口令同闸收口", chute_id),
+        )
+        audit(conn, "口门", chute_id, "闭口拒在途",
+              f"在途{len(inflight)}笔同闸整拒: 扫描{[x['scan_id'] for x in inflight]}")
+
+    detail = views.chute_detail(conn, updated)
 
     if target == "口门闭":
         outcome = CLOSE_CARRY
@@ -381,9 +423,10 @@ def _gate_decisive(conn, chute_id: int, target: str) -> dict:
                 "在口件数": detail["在口件数"],
                 "在途裁决数": len(inflight),
                 "带上件编号": [x["id"] for x in landed],
+                "在途已拒编号": [x["scan_id"] for x in inflight],
             },
             note=("重复闭口" if already else "闭口") +
-                 (f"；在口{len(landed)}件已带上；在途{len(inflight)}笔将整拒" if inflight
+                 (f"；在口{len(landed)}件已带上；在途{len(inflight)}笔同闸整拒" if inflight
                   else f"；在口{len(landed)}件已带上"),
         )
     else:
@@ -411,6 +454,7 @@ def _gate_decisive(conn, chute_id: int, target: str) -> dict:
             "在途裁决数": len(inflight),
             "在途裁决": inflight,
             "在途将拒": [x["scan_id"] for x in inflight],
+            "在途已拒": [x["scan_id"] for x in inflight],
             "对撞号": code,
             "collision_code": code,
             "结局": outcome,
@@ -432,6 +476,8 @@ def _gate_decisive(conn, chute_id: int, target: str) -> dict:
             "在途路由数": len(inflight),
             "在途将拒": [x["scan_id"] for x in inflight],
             "在途将拒编号": [x["scan_id"] for x in inflight],
+            "在途已拒": [x["scan_id"] for x in inflight],
+            "在途已拒编号": [x["scan_id"] for x in inflight],
         })
     else:
         payload.update({"开口回执": {"口门编号": chute_id, "口门状态": target}})
@@ -527,10 +573,15 @@ def _self_consistency_checks(run: dict) -> list[dict]:
                         (before.get("chute") or {}).get("在口件数"),
                         (after.get("chute") or {}).get("在口件数")))
     elif run["outcome"] == HALF_ROLLBACK:
-        out.append(_chk("结局自洽:半截后扫描仍待路由", "待路由",
-                        (after.get("scan") or {}).get("status")))
-        out.append(_chk("结局自洽:半截后扫描口门列为空", None,
-                        (after.get("scan") or {}).get("chute_id")))
+        if "scan" in before or "scan" in after:
+            out.append(_chk("结局自洽:半截后扫描仍待路由", "待路由",
+                            (after.get("scan") or {}).get("status")))
+            out.append(_chk("结局自洽:半截后扫描口门列为空", None,
+                            (after.get("scan") or {}).get("chute_id")))
+        if "chute" in before and "chute" in after:
+            out.append(_chk("结局自洽:半截后口门态退回对撞前",
+                            (before.get("chute") or {}).get("status"),
+                            (after.get("chute") or {}).get("status")))
     elif run["outcome"] == ROUTE_FIRST_LAND:
         out.append(_chk("结局自洽:裁决后已路由", "已路由",
                         (after.get("scan") or {}).get("status")))
@@ -828,11 +879,4 @@ def repair(stale_seconds: float | None = None) -> dict:
         "修复后": after,
         "一致": after["一致"],
     }
-
-_adjudicate_impl = adjudicate
-
-
-def adjudicate(*args, **kwargs):
-    out = _adjudicate_impl(*args, **kwargs)
-    return close_surface.after_route(out, *args, **kwargs)
 

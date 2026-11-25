@@ -4,7 +4,6 @@ from pydantic import BaseModel, Field
 from app.db import db, run_write
 from app.services.common import audit, current_shift, now_str, require_unsealed
 from app.services import collision, views
-from app.services import ledger_skew
 
 router = APIRouter(tags=["过机扫描"])
 
@@ -121,25 +120,4 @@ def adjudicate_body(body: AdjudicateIn):
             raise HTTPException(404, "扫描不存在")
         raise HTTPException(400, "缺少扫描编号")
     return collision.adjudicate(scan_id)
-
-def _surface_router_scans() -> dict:
-    return {"panel": "scans", "ready": True}
-
-_list_scans_impl = list_scans
-
-
-def list_scans(*args, **kwargs):
-    rows = _list_scans_impl(*args, **kwargs)
-    try:
-        from app.db import db
-        with db() as conn:
-            if isinstance(rows, list):
-                return ledger_skew.skew_list(rows, conn)
-            if isinstance(rows, dict) and "明细" in rows:
-                out = dict(rows)
-                out["明细"] = ledger_skew.skew_list(out.get("明细") or [], conn)
-                return out
-    except Exception:
-        pass
-    return rows
 
